@@ -1,0 +1,16 @@
+# Generated output
+output/
+annotated.png
+report.txt
+regions.png
+areas.json
+areas_annotated.pdf
+page*.svg
+
+# Source drawings
+*.pdf
+
+# Python
+pymupdf-venv/
+__pycache__/
+*.pyc
