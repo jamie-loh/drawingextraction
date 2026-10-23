@@ -303,9 +303,14 @@ def table_entity(tb, lines):
             if ov > 0 and ov >= 0.15 * r.width:
                 parts.append(l["text"])
         name = norm(" ".join(parts))
-        columns.append(unique_key(snake(name) or f"col_{c + 1}", taken))
+        # a header cell holding a drawing (many labels, mostly with digits) is not a name
+        #column has drawings inside 
+        looks_like_drawing = len(parts) >= 3 and sum(any(ch.isdigit() for ch in p) for p in parts) > len(parts) / 2
+        key = "" if looks_like_drawing else snake(name)
+        columns.append(unique_key(key or f"col_{c + 1}", taken))
 
-    rows = []
+    #rmb which band became which row
+    rows, row_of_band = [], {}
     bands = [(ys[i], ys[i + 1]) for i in range(len(ys) - 1) if ys[i] >= hb - 0.5]
     for top, bottom in bands:
         row = {}
@@ -316,9 +321,52 @@ def table_entity(tb, lines):
             row[key] = text or None
         if any(v is not None for v in row.values()):
             rows.append({"row": len(rows) + 1, **row})
+            row_of_band[(top, bottom)] = len(rows)
+    tb["row_of_band"] = row_of_band
     return {"columns": columns, "rows": rows}, inside
 
+def busy_cells(tb, items, min_items=20, inset=2.0):
+    """Cheap first check. Cells that hold at least min_items vector items inside them
+    (the table's own rules sit on the cell border, so they are not counted). The header
+    band counts as one cell per column. No result = a simple, text-only table."""
+    xs, ys, hb = tb["xs"], tb["ys"], tb["hb"]
+    bands = [(ys[0], hb)] + [(ys[i], ys[i + 1]) for i in range(len(ys) - 1) if ys[i] >= hb - 0.5]
+    out = []
+    for bi, band in enumerate(bands):
+        for c in range(len(xs) - 1):
+            cell = pymupdf.Rect(xs[c], band[0], xs[c + 1], band[1])
+            inner = cell + (inset, inset, -inset, -inset)
+            hit = [r for r, _ in items if inner.contains(r)]
+            if len(hit) >= min_items:
+                out.append({"band": band, "is_header": bi == 0, "col": c, "cell": cell, "items": hit})
+    return out
 
+def cell_drawings(tb, payload, busy, lines, min_dim=0.0):
+    """Only for tables that are not simple: turn each busy cell into a detail view if its
+    drawing is at least min_dim wide and tall (this skips thin markup such as a revision
+    cloud around one line of text). Each hit carries the cell position and the other
+    values in the same column."""
+    columns, rows = payload["columns"], payload["rows"]
+    out = []
+    for b in busy:
+        c, cell = b["col"], b["cell"]
+        content = [l for l in lines if cell.contains(pymupdf.Point(cx(l["rect"]), cy(l["rect"])))]
+        rect = pymupdf.Rect(b["items"][0])  # tight box: the drawing and its labels, not the whole cell
+        for r in b["items"]:
+            rect |= r
+        if rect.width < min_dim or rect.height < min_dim:
+            continue
+        for l in content:
+            rect |= l["rect"]
+        row_no = 0 if b["is_header"] else tb["row_of_band"].get(b["band"])  # 0 = header band
+        same_column = {}
+        for r in rows:
+            label = r[columns[0]] if c != 0 else None
+            if r[columns[c]] is not None:
+                same_column[label or f'row_{r["row"]}'] = r[columns[c]]
+        out.append({"rect": rect, "lines": content,
+                    "cell": {"row": row_no, "column": columns[c]}, "same_column": same_column})
+    return out
 # -------------------------------------------------------------------- titles
 def underlined_lines(lines, thin):
     out = []
@@ -416,11 +464,23 @@ def connected_components(items, tol):
 def prune_dangling(Hs, Vs, tol=1.5):
     """Keep only rules whose both ends meet a perpendicular rule. Cell dividers do;
     lines drawn inside a stamp or logo end in free space."""
+
+    #for drawings that do not have a title
+    #let a lines end count as touching if it reaches the outer edge of the whole title
+    if not Hs and not Vs:
+        return Hs, Vs
+    x0 = min([h[0] for h in Hs] + [v[2] for v in Vs])
+    x1 = max([h[1] for h in Hs] + [v[2] for v in Vs])
+    y0 = min([h[2] for h in Hs] + [v[0] for v in Vs])
+    y1 = max([h[2] for h in Hs] + [v[1] for v in Vs])
+
     def touches_v(x, y):
-        return any(abs(v[2] - x) <= tol and v[0] - tol <= y <= v[1] + tol for v in Vs)
+        return abs(x - x0) <= tol or abs(x - x1) <= tol or any(
+            abs(v[2] - x) <= tol and v[0] - tol <= y <= v[1] + tol for v in Vs)
 
     def touches_h(x, y):
-        return any(abs(h[2] - y) <= tol and h[0] - tol <= x <= h[1] + tol for h in Hs)
+        return abs(y - y0) <= tol or abs(y - y1) <= tol or any(
+            abs(h[2] - y) <= tol and h[0] - tol <= x <= h[1] + tol for h in Hs)
 
     return ([h for h in Hs if touches_v(h[0], h[2]) and touches_v(h[1], h[2])],
             [v for v in Vs if touches_h(v[2], v[0]) and touches_h(v[2], v[1])])
@@ -484,6 +544,8 @@ def detect(page, tol=10.0, pad=6.0, min_items=20, max_title_gap=60.0):
 
     # 1. tables
     tables = find_tables(Hm, Vm, W, H)
+    heights = sorted(l["rect"].height for l in lines)
+    min_drawing = 4 * heights[len(heights) // 2] if heights else 0.0  # 4 x the typical text height
 
     # 2. titles (underlined text outside tables' cells)
     def in_table(l, margin=0.0):
@@ -513,9 +575,19 @@ def detect(page, tol=10.0, pad=6.0, min_items=20, max_title_gap=60.0):
             rect |= tb["title"]["rect"]
             text_lines += tb["title"]["lines"]
         claimed |= {id(l) for l in text_lines}
-        areas.append({"type": "table", "title": tb["title"]["text"] if tb["title"] else None,
-                      "rect": rect, "payload": payload})
+        table_area = {"type": "table", "title": tb["title"]["text"] if tb["title"] else None,
+                      "rect": rect, "payload": payload}
+        areas.append(table_area)
+        busy = busy_cells(tb, items, min_items)
+        simple_table = not busy  # no cell holds a pile of vector items: text only
+        if not simple_table:     # otherwise some cells hold drawings: extract them as detail views
+            for d in cell_drawings(tb, payload, busy, lines, min_dim=min_drawing):
+                areas.append({"type": "detail_view", "title": None, "subtitle": None, "rect": d["rect"],
+                              "payload": {"text": merge_paragraphs(d["lines"])},
+                              "line_rects": [pymupdf.Rect(l["rect"]) for l in d["lines"]],
+                              "parent_area": table_area, "cell": d["cell"], "same_column": d["same_column"]})
 
+                              
     # 4. detail views: groups of items matched to the remaining titles
     table_rects = [tb["rect"] + (-3, -3, 3, 3) for tb in tables]
     table_title_rects = [a["rect"] for a in areas]
@@ -534,7 +606,7 @@ def detect(page, tol=10.0, pad=6.0, min_items=20, max_title_gap=60.0):
 
     # markup drawn over / beside a table (revision clouds, tick marks) belongs to that table
     for c in comps:
-        if any(c["rect"].intersects(tb["rect"] + (-3 * tol, -3 * tol, 3 * tol, 3 * tol)) for tb in tables):
+        if any(c["rect"].intersects(tb["rect"] + (-tol, -tol, tol, tol)) for tb in tables):
             c["used"] = True
 
     def comp_for(t):
@@ -575,6 +647,7 @@ def detect(page, tol=10.0, pad=6.0, min_items=20, max_title_gap=60.0):
                       "subtitle": norm(sub["text"]) if sub else None,
                       "rect": rect, "payload": payload, "line_rects": [pymupdf.Rect(l["rect"]) for l in own + content]})
 
+    #after titles are matched, any leftover group thats big enough is kept
     for c in comps:
         if not c["used"] and c["n"] >= min_items:
             rect = pymupdf.Rect(c["rect"])
@@ -695,16 +768,33 @@ def main():
     areas, drawing, unclaimed, warnings = detect(page, tol=args.tol, pad=args.pad)
 
     stem = os.path.splitext(os.path.basename(args.pdf))[0]
-    seen, entities = set(), []
-    for i, a in enumerate(areas, 1):
-        base = f'{stem}#{slug(a["title"]) if a["title"] else "untitled"}'
+    seen, eid_of = set(), {}
+ 
+    def new_id(base):
         eid, n = base, 2
-        while eid in seen:  # same title twice: number it
+        while eid in seen:  # same name twice: number it
             eid, n = f"{base}-{n}", n + 1
         seen.add(eid)
-        ent = {"id": i, "entity_id": eid, "type": a["type"], "title": a["title"]}
+        return eid
+ 
+    for a in areas:  # first everything with its own title, then drawings inside tables
+        if a.get("parent_area") is None:
+            eid_of[id(a)] = new_id(f'{stem}#{slug(a["title"]) if a["title"] else "untitled"}')
+    for a in areas:
+        if a.get("parent_area") is not None:
+            cell = a["cell"]
+            eid_of[id(a)] = new_id(f'{eid_of[id(a["parent_area"])]}.r{cell["row"]}.{cell["column"]}')
+ 
+    entities = []
+    for i, a in enumerate(areas, 1):
+        ent = {"id": i, "entity_id": eid_of[id(a)], "type": a["type"], "title": a["title"]}
         if a.get("subtitle"):
             ent["subtitle"] = a["subtitle"]
+        if a.get("parent_area") is not None:
+            ent["parent"] = eid_of[id(a["parent_area"])]
+            ent["table_cell"] = a["cell"]
+            ent["same_column"] = a["same_column"]
+      
         if args.bbox:
             ent["bbox"] = [round(v, 1) for v in a["rect"]]  # x0, y0, x1, y1
         ent.update(a["payload"])
